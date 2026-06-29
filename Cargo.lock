@@ -14858,6 +14858,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "recent_projects"
 version = "0.1.0"
 dependencies = [
@@ -23040,6 +23050,7 @@ dependencies = [
  "prompt_store",
  "proto",
  "rayon",
+ "reader",
  "recent_projects",
  "release_channel",
  "remote",
