@@ -153,6 +153,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("View Page", reader::ViewPage),
                 MenuItem::action("Extract Text", reader::ExtractText),
                 MenuItem::action("Recognize Text (OCR)", reader::Ocr),
+                MenuItem::action("Analyze Image", reader::AnalyzeImage),
                 MenuItem::action("Narrate to Audio", reader::Narrate),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu {
@@ -160,13 +161,26 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     disabled: false,
                     items: vec![
                         MenuItem::action("Combine", reader::Combine),
-                        MenuItem::action("Split", reader::Split),
+                        MenuItem::action("Split into Pages", reader::Split),
+                        MenuItem::action("Split into Chunks", reader::SplitBy),
                         MenuItem::action("Rotate 90°", reader::Rotate),
                         MenuItem::action("Normalize to Letter", reader::Normalize),
                         MenuItem::action("Deskew", reader::Deskew),
                         MenuItem::action("Compress", reader::Compress),
                     ],
                 }),
+                MenuItem::submenu(Menu {
+                    name: "Re-render for Device".into(),
+                    disabled: false,
+                    items: vec![
+                        MenuItem::action("iPhone 17 Pro", reader::DeviceIphone),
+                        MenuItem::action("iPad mini", reader::DeviceIpad),
+                        MenuItem::action("Letter", reader::DeviceLetter),
+                    ],
+                }),
+                MenuItem::separator(),
+                MenuItem::action("Export for AI (RAG)", reader::RagExport),
+                MenuItem::action("Back Up Library", reader::BackupNow),
             ],
         },
         Menu {

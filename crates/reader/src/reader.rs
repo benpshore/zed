@@ -42,6 +42,13 @@ actions!(
         Deskew,
         Normalize,
         ToggleContents,
+        DeviceIphone,
+        DeviceIpad,
+        DeviceLetter,
+        SplitBy,
+        RagExport,
+        AnalyzeImage,
+        BackupNow,
     ]
 );
 
@@ -111,6 +118,41 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &Normalize, _, cx| {
             if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.normalize_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &DeviceIphone, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.device_render("iphone17pro", cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &DeviceIpad, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.device_render("ipadmini", cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &DeviceLetter, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.device_render("letter", cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &SplitBy, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.split_by_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &RagExport, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.rag_export_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &AnalyzeImage, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.analyze_image_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &BackupNow, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.backup_now(cx));
             }
         });
     })
@@ -759,6 +801,107 @@ impl ReaderPanel {
         self.run_pdf_tool(
             "Normalizing to Letter…",
             vec!["normalize".into(), "--asset".into(), asset.to_string()],
+            cx,
+        );
+    }
+
+    /// Run an engine command and report a summary (from `format_ok`) in the
+    /// status line — for tools whose result isn't a single openable file.
+    fn run_status<F>(&mut self, verb: &str, args: Vec<String>, format_ok: F, cx: &mut Context<Self>)
+    where
+        F: Fn(&Value) -> String + Send + 'static,
+    {
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        self.begin(verb, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    engine_json(&bin, &dir, &refs)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(v) => format_ok(v).into(),
+                    Err(e) => format!("Failed: {e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn device_render(&mut self, target: &str, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_pdf_tool(
+            "Re-rendering for device…",
+            vec![
+                "device".into(),
+                "--asset".into(),
+                asset.to_string(),
+                "--target".into(),
+                target.to_string(),
+            ],
+            cx,
+        );
+    }
+
+    fn split_by_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_status(
+            "Splitting into chunks…",
+            vec!["split-by".into(), "--asset".into(), asset.to_string()],
+            |v| {
+                let n = v.get("chunks").and_then(|c| c.as_i64()).unwrap_or(0);
+                format!("Split into {n} chunk(s) — in the library's exports/")
+            },
+            cx,
+        );
+    }
+
+    fn rag_export_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_pdf_tool(
+            "Exporting RAG (JSONL)…",
+            vec!["rag".into(), "--asset".into(), asset.to_string()],
+            cx,
+        );
+    }
+
+    fn analyze_image_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_status(
+            "Analyzing image…",
+            vec!["analyze-image".into(), "--asset".into(), asset.to_string()],
+            |v| {
+                let labels: Vec<String> = v
+                    .get("labels")
+                    .and_then(|l| l.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .take(4)
+                            .filter_map(|l| l.get("label").and_then(|s| s.as_str()))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if labels.is_empty() {
+                    "No labels detected.".to_string()
+                } else {
+                    format!("Detected: {}", labels.join(", "))
+                }
+            },
+            cx,
+        );
+    }
+
+    fn backup_now(&mut self, cx: &mut Context<Self>) {
+        self.run_status(
+            "Backing up library…",
+            vec!["backup".into()],
+            |_| "Library backed up.".to_string(),
             cx,
         );
     }
