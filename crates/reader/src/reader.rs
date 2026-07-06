@@ -226,7 +226,26 @@ impl ReaderPanel {
                 .background_spawn(async move {
                     let a = asset.to_string();
                     let o = out_engine.to_string_lossy().to_string();
-                    engine_json(&bin, &dir, &["doc-text", "--asset", &a, "--out", &o])
+                    // Native text layer first; if the document has none (a scan
+                    // or an image), fall back to on-device OCR automatically.
+                    let native = engine_json(&bin, &dir, &["doc-text", "--asset", &a, "--out", &o]);
+                    let has_text = native
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v.get("chars").and_then(|c| c.as_i64()))
+                        .unwrap_or(0)
+                        > 0;
+                    if has_text {
+                        native
+                    } else {
+                        engine_json(&bin, &dir, &["ocr-asset", "--asset", &a, "--out", &o])
+                            .map(|mut v| {
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert("ocr".into(), serde_json::Value::Bool(true));
+                                }
+                                v
+                            })
+                    }
                 })
                 .await;
             let ok = result.is_ok();
@@ -235,9 +254,50 @@ impl ReaderPanel {
                 this.status = match &result {
                     Ok(v) => {
                         let chars = v.get("chars").and_then(|c| c.as_i64()).unwrap_or(0);
-                        format!("Extracted {chars} characters — opening…").into()
+                        let how = if v.get("ocr").is_some() { " (OCR)" } else { "" };
+                        format!("Extracted {chars} characters{how} — opening…").into()
                     }
                     Err(e) => format!("Extract failed: {e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+            if ok {
+                ws.update_in(cx, |ws, window, cx| {
+                    ws.open_abs_path(out.clone(), OpenOptions::default(), window, cx)
+                        .detach();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Force on-device OCR of the selected document and open the text as a tab.
+    fn ocr_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        let out = std::env::temp_dir().join(format!("zenpdf-asset{asset}-ocr.txt"));
+        let out_engine = out.clone();
+        let ws = self.workspace.clone();
+        self.begin("Recognizing text (OCR)…", cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let a = asset.to_string();
+                    let o = out_engine.to_string_lossy().to_string();
+                    engine_json(&bin, &dir, &["ocr-asset", "--asset", &a, "--out", &o])
+                })
+                .await;
+            let ok = result.is_ok();
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(v) => {
+                        let chars = v.get("chars").and_then(|c| c.as_i64()).unwrap_or(0);
+                        format!("Recognized {chars} characters — opening…").into()
+                    }
+                    Err(e) => format!("OCR failed: {e}").into(),
                 };
                 cx.notify();
             })
@@ -707,7 +767,13 @@ impl Render for ReaderPanel {
                         h_flex()
                             .gap_1()
                             .flex_wrap()
-                            .child(Button::new("t-ocr", ocr_label).disabled(!ocr_available))
+                            .child(
+                                Button::new("t-ocr", ocr_label)
+                                    .disabled(!ocr_available)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.ocr_selected(window, cx)
+                                    })),
+                            )
                             .child(Button::new("t-compress", "Compress (soon)").disabled(true))
                             .child(Button::new("t-deskew", "Deskew (soon)").disabled(true)),
                     ),
