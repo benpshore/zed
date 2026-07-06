@@ -20,6 +20,7 @@ use gpui::{
 };
 use serde_json::Value;
 use ui::prelude::*;
+use ui_input::InputField;
 use workspace::{
     OpenOptions, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -46,6 +47,14 @@ struct Doc {
     status: SharedString,
 }
 
+/// One full-text search hit from the engine.
+#[derive(Clone, Debug)]
+struct SearchHit {
+    page: i64,
+    filename: SharedString,
+    snippet: SharedString,
+}
+
 pub struct ReaderPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -67,6 +76,10 @@ pub struct ReaderPanel {
     playing: bool,
     /// Bumped to cancel an in-flight playback loop.
     play_generation: u64,
+    /// The library search box.
+    search_input: Entity<InputField>,
+    /// Results of the last search.
+    search_hits: Vec<SearchHit>,
 }
 
 impl ReaderPanel {
@@ -74,7 +87,8 @@ impl ReaderPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
-        cx.update(|_window, cx| {
+        cx.update(|window, cx| {
+            let search_input = cx.new(|cx| InputField::new(window, cx, "Search library…"));
             cx.new(|cx| {
                 let mut panel = ReaderPanel {
                     focus_handle: cx.focus_handle(),
@@ -90,6 +104,8 @@ impl ReaderPanel {
                     played_chapters: Vec::new(),
                     playing: false,
                     play_generation: 0,
+                    search_input,
+                    search_hits: Vec::new(),
                 };
                 panel.refresh(cx);
                 panel.load_capabilities(cx);
@@ -463,6 +479,68 @@ impl ReaderPanel {
             .args(["-x", "afplay"])
             .status();
         cx.notify();
+    }
+
+    /// Run a full-text search over the library (FTS5 in the engine).
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text(cx);
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.search_hits.clear();
+            self.status = "Type a search query first.".into();
+            cx.notify();
+            return;
+        }
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        self.begin("Searching…", cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    engine_json(&bin, &dir, &["search", "--query", &query, "--limit", "30"])
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(v) => {
+                        this.search_hits = v
+                            .get("hits")
+                            .and_then(|h| h.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|h| {
+                                        Some(SearchHit {
+                                            page: h.get("page")?.as_i64()?,
+                                            filename: h
+                                                .get("filename")
+                                                .and_then(|f| f.as_str())
+                                                .unwrap_or("")
+                                                .to_string()
+                                                .into(),
+                                            snippet: h
+                                                .get("snippet")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("")
+                                                .to_string()
+                                                .into(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        this.status = match this.search_hits.len() {
+                            0 => "No matches.".into(),
+                            1 => "1 match".into(),
+                            n => format!("{n} matches").into(),
+                        };
+                    }
+                    Err(e) => this.status = format!("Search failed: {e}").into(),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A no-argument engine mutation (combine / split / rotate) reported in
@@ -869,6 +947,56 @@ impl Render for ReaderPanel {
             None
         };
 
+        // --- library search ----------------------------------------------------
+        let mut search_section = v_flex()
+            .gap_1()
+            .mt_2()
+            .pt_2()
+            .border_t_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().flex_grow(1.).child(self.search_input.clone()))
+                    .child(
+                        Button::new("do-search", "Search")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.run_search(cx))),
+                    ),
+            );
+        if !self.search_hits.is_empty() {
+            let shown = self.search_hits.len().min(10);
+            for hit in self.search_hits.iter().take(shown) {
+                search_section = search_section.child(
+                    v_flex()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(elevated)
+                        .child(
+                            Label::new(SharedString::from(format!(
+                                "p.{} · {}",
+                                hit.page, hit.filename
+                            )))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(Label::new(hit.snippet.clone()).size(LabelSize::Small)),
+                );
+            }
+            if self.search_hits.len() > shown {
+                search_section = search_section.child(
+                    Label::new(SharedString::from(format!(
+                        "…and {} more",
+                        self.search_hits.len() - shown
+                    )))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                );
+            }
+        }
+
         // --- in-app audio player (shown after a narration) --------------------
         let play_controls = if has_audio {
             let toggle = if playing {
@@ -929,6 +1057,7 @@ impl Render for ReaderPanel {
                     .child(header)
                     .child(list)
                     .when_some(toolbar, |el, tb| el.child(tb))
+                    .child(search_section)
                     .when_some(play_controls, |el, pc| el.child(pc))
                     .child(footer),
             )

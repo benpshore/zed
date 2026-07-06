@@ -14865,6 +14865,7 @@ dependencies = [
  "gpui",
  "serde_json",
  "ui",
+ "ui_input",
  "workspace",
 ]
 
