@@ -61,6 +61,12 @@ pub struct ReaderPanel {
     capabilities: Option<SharedString>,
     /// Whether the OCR runtime + models are installed (enables the OCR tool).
     ocr_available: bool,
+    /// Chapter audio files from the last narration (for the in-app player).
+    played_chapters: Vec<PathBuf>,
+    /// Whether playback is currently running.
+    playing: bool,
+    /// Bumped to cancel an in-flight playback loop.
+    play_generation: u64,
 }
 
 impl ReaderPanel {
@@ -81,6 +87,9 @@ impl ReaderPanel {
                     busy: false,
                     capabilities: None,
                     ocr_available: false,
+                    played_chapters: Vec::new(),
+                    playing: false,
+                    play_generation: 0,
                 };
                 panel.refresh(cx);
                 panel.load_capabilities(cx);
@@ -383,20 +392,77 @@ impl ReaderPanel {
                 this.busy = false;
                 this.status = match &result {
                     Ok(v) => {
-                        let n = v
+                        let paths: Vec<PathBuf> = v
                             .get("chapters")
                             .and_then(|c| c.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        format!("Narrated {n} chapter(s) — revealed in Finder ({shown})").into()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|c| {
+                                        c.get("path").and_then(|p| p.as_str()).map(PathBuf::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let n = paths.len();
+                        let engine = v.get("engine").and_then(|e| e.as_str()).unwrap_or("");
+                        this.played_chapters = paths;
+                        format!("Narrated {n} chapter(s) with {engine} — press Play ▶").into()
                     }
                     Err(e) => format!("Narrate failed: {e}").into(),
                 };
                 cx.notify();
             })
             .ok();
+            let _ = shown; // path is also revealed in Finder by the engine
         })
         .detach();
+    }
+
+    /// Play the narrated chapters in order via the built-in `afplay`.
+    fn play(&mut self, cx: &mut Context<Self>) {
+        if self.played_chapters.is_empty() {
+            return;
+        }
+        self.playing = true;
+        self.play_generation += 1;
+        let generation = self.play_generation;
+        let chapters = self.played_chapters.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            for chapter in chapters {
+                let still_playing = this
+                    .read_with(cx, |this, _| this.playing && this.play_generation == generation)
+                    .unwrap_or(false);
+                if !still_playing {
+                    break;
+                }
+                let _ = cx
+                    .background_spawn(async move {
+                        std::process::Command::new("/usr/bin/afplay")
+                            .arg(&chapter)
+                            .status()
+                    })
+                    .await;
+            }
+            this.update(cx, |this, cx| {
+                if this.play_generation == generation {
+                    this.playing = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stop playback (invalidate the loop + kill any running `afplay`).
+    fn stop_playback(&mut self, cx: &mut Context<Self>) {
+        self.playing = false;
+        self.play_generation += 1;
+        let _ = std::process::Command::new("/usr/bin/pkill")
+            .args(["-x", "afplay"])
+            .status();
+        cx.notify();
     }
 
     /// A no-argument engine mutation (combine / split / rotate) reported in
@@ -648,6 +714,9 @@ impl Render for ReaderPanel {
         let selected_bg = colors.element_selected;
         let has_selection = self.selected.is_some();
         let ocr_available = self.ocr_available;
+        let playing = self.playing;
+        let has_audio = !self.played_chapters.is_empty();
+        let n_chapters = self.played_chapters.len();
 
         // --- header: wordmark + quiet subtitle + Import -----------------------
         let header = v_flex()
@@ -800,6 +869,31 @@ impl Render for ReaderPanel {
             None
         };
 
+        // --- in-app audio player (shown after a narration) --------------------
+        let play_controls = if has_audio {
+            let toggle = if playing {
+                Button::new("pb-stop", "■ Stop")
+                    .on_click(cx.listener(|this, _, _, cx| this.stop_playback(cx)))
+            } else {
+                Button::new("pb-play", "▶ Play")
+                    .on_click(cx.listener(|this, _, _, cx| this.play(cx)))
+            };
+            Some(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .mt_2()
+                    .child(toggle)
+                    .child(
+                        Label::new(SharedString::from(format!("{n_chapters} chapter(s)")))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+        } else {
+            None
+        };
+
         // --- status footer ----------------------------------------------------
         let mut footer = v_flex()
             .gap_0p5()
@@ -835,6 +929,7 @@ impl Render for ReaderPanel {
                     .child(header)
                     .child(list)
                     .when_some(toolbar, |el, tb| el.child(tb))
+                    .when_some(play_controls, |el, pc| el.child(pc))
                     .child(footer),
             )
     }
