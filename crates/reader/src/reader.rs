@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Pixels, Render,
-    SharedString, Styled, WeakEntity, Window, actions, div, px,
+    Focusable, Global, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Pixels,
+    Render, SharedString, Styled, Subscription, WeakEntity, Window, actions, div, px,
 };
 use serde_json::Value;
 use ui::prelude::*;
@@ -41,15 +41,22 @@ actions!(
         Compress,
         Deskew,
         Normalize,
+        ToggleContents,
     ]
 );
 
 /// Register the Reader panel's actions on every workspace so the app menu can
 /// drive the tools (they act on the panel's selected document).
 pub fn init(cx: &mut App) {
+    // Default selection so the Contents panel can read the global before any
+    // document is picked.
+    cx.set_global(ZenSelection::default());
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ReaderPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleContents, window, cx| {
+            workspace.toggle_panel_focus::<ContentsPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &Import, _, cx| {
             if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
@@ -126,6 +133,19 @@ struct SearchHit {
     filename: SharedString,
     snippet: SharedString,
 }
+
+/// Shared current-document selection, published by the left Files panel and
+/// observed by the right Contents panel.
+#[derive(Clone, Default)]
+struct ZenSelection {
+    asset: Option<i64>,
+    filename: SharedString,
+    pages: Option<i64>,
+    engine_bin: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl Global for ZenSelection {}
 
 pub struct ReaderPanel {
     focus_handle: FocusHandle,
@@ -862,7 +882,7 @@ impl Panel for ReaderPanel {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Right
+        DockPosition::Left
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
@@ -878,7 +898,7 @@ impl Panel for ReaderPanel {
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(440.)
+        px(420.)
     }
 
     /// Zen PDF is the reason this build exists, so the panel is visible by
@@ -892,7 +912,7 @@ impl Panel for ReaderPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Zen PDF")
+        Some("Zen PDF — Files")
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
@@ -968,6 +988,8 @@ impl Render for ReaderPanel {
                     .map(|p| format!("{p} page{}", if p == 1 { "" } else { "s" }))
                     .unwrap_or_else(|| "—".into());
                 let id = doc.id;
+                let doc_name = doc.filename.clone();
+                let doc_pages = doc.pages;
                 list = list.child(
                     div()
                         .id(("doc", doc.id as usize))
@@ -980,6 +1002,14 @@ impl Render for ReaderPanel {
                         .hover(|s| s.bg(selected_bg))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.selected = Some(id);
+                            // Publish the selection so the Contents panel updates.
+                            cx.set_global(ZenSelection {
+                                asset: Some(id),
+                                filename: doc_name.clone(),
+                                pages: doc_pages,
+                                engine_bin: this.engine_bin.clone(),
+                                data_dir: this.data_dir.clone(),
+                            });
                             cx.notify();
                         }))
                         .child(
@@ -1119,5 +1149,210 @@ impl Render for ReaderPanel {
                     .when_some(play_controls, |el, pc| el.child(pc))
                     .child(footer),
             )
+    }
+}
+
+// ============================================================================
+// Contents panel (right dock): the outline / structure of the selected doc.
+// ============================================================================
+
+pub struct ContentsPanel {
+    focus_handle: FocusHandle,
+    title: SharedString,
+    pages: Option<i64>,
+    headings: Vec<SharedString>,
+    busy: bool,
+    _selection: Subscription,
+}
+
+impl ContentsPanel {
+    pub async fn load(
+        _workspace: WeakEntity<Workspace>,
+        mut cx: AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        cx.update(|_window, cx| {
+            cx.new(|cx| {
+                let subscription =
+                    cx.observe_global::<ZenSelection>(|this: &mut ContentsPanel, cx| {
+                        this.refresh(cx);
+                    });
+                let mut panel = ContentsPanel {
+                    focus_handle: cx.focus_handle(),
+                    title: "No document selected".into(),
+                    pages: None,
+                    headings: Vec::new(),
+                    busy: false,
+                    _selection: subscription,
+                };
+                panel.refresh(cx);
+                panel
+            })
+        })
+    }
+
+    /// Reload the outline for whatever document is currently selected.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        // try_global: the global may not be set yet when the panel first loads.
+        let selection = cx.try_global::<ZenSelection>().cloned().unwrap_or_default();
+        self.title = if selection.filename.is_empty() {
+            "No document selected".into()
+        } else {
+            selection.filename.clone()
+        };
+        self.pages = selection.pages;
+        let Some(asset) = selection.asset else {
+            self.headings.clear();
+            cx.notify();
+            return;
+        };
+        let (bin, dir) = (selection.engine_bin, selection.data_dir);
+        self.busy = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    engine_json(&bin, &dir, &["outline", "--asset", &asset.to_string()])
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                if let Ok(value) = result {
+                    this.headings = value
+                        .get("headings")
+                        .and_then(|h| h.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|h| {
+                                    h.get("title")
+                                        .and_then(|t| t.as_str())
+                                        .map(|s| SharedString::from(s.to_string()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+impl Panel for ContentsPanel {
+    fn persistent_name() -> &'static str {
+        "ZenContentsPanel"
+    }
+
+    fn panel_key() -> &'static str {
+        "ZenContentsPanel"
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Right
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        px(300.)
+    }
+
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
+        true
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
+        Some(ui::IconName::ListTree)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Zen PDF — Contents")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleContents)
+    }
+
+    fn activation_priority(&self) -> u32 {
+        8
+    }
+}
+
+impl Focusable for ContentsPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<PanelEvent> for ContentsPanel {}
+
+impl Render for ContentsPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let border = colors.border;
+
+        let mut root = v_flex()
+            .track_focus(&self.focus_handle)
+            .key_context("ZenContentsPanel")
+            .size_full()
+            .bg(colors.panel_background)
+            .p_4()
+            .gap_1()
+            .child(
+                Label::new("Contents")
+                    .size(LabelSize::Large)
+                    .weight(gpui::FontWeight::SEMIBOLD),
+            )
+            .child(
+                Label::new(self.title.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+
+        if let Some(p) = self.pages {
+            root = root.child(
+                Label::new(SharedString::from(format!(
+                    "{p} page{}",
+                    if p == 1 { "" } else { "s" }
+                )))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            );
+        }
+
+        let mut body = v_flex().gap_0p5().mt_2();
+        if self.busy {
+            body = body.child(Label::new("Reading structure…").color(Color::Muted));
+        } else if self.headings.is_empty() {
+            body = body.child(
+                Label::new("No detected headings for this document.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+        } else {
+            for heading in self.headings.iter().take(200) {
+                body = body.child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .border_l_2()
+                        .border_color(border)
+                        .child(Label::new(heading.clone()).size(LabelSize::Small)),
+                );
+            }
+        }
+
+        root.child(body)
     }
 }

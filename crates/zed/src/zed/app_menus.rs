@@ -146,7 +146,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Zen PDF".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Show Panel", reader::ToggleFocus),
+                MenuItem::action("Show Files Panel", reader::ToggleFocus),
+                MenuItem::action("Show Contents Panel", reader::ToggleContents),
                 MenuItem::action("Import…", reader::Import),
                 MenuItem::separator(),
                 MenuItem::action("View Page", reader::ViewPage),
