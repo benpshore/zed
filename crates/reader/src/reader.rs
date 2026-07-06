@@ -294,19 +294,29 @@ impl ReaderPanel {
         .detach();
     }
 
-    /// Narrate the selected document to chaptered audio files.
+    /// Narrate the selected document to chaptered audio files, written to a
+    /// findable folder and revealed in Finder so it can be played.
     fn narrate(&mut self, cx: &mut Context<Self>) {
         let Some(asset) = self.selected else { return };
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
-        let out_dir = std::env::temp_dir().join(format!("zenpdf-audio-asset{asset}"));
+        // A stable, reachable location under the library — not a hidden temp dir.
+        let out_dir = self.data_dir.join("audio").join(format!("asset{asset}"));
         let shown = out_dir.to_string_lossy().to_string();
         self.begin("Narrating to audio…", cx);
         cx.spawn(async move |this, cx| {
+            let out_dir_for_reveal = out_dir.clone();
             let result = cx
                 .background_spawn(async move {
                     let a = asset.to_string();
                     let o = out_dir.to_string_lossy().to_string();
-                    engine_json(&bin, &dir, &["listen", "--asset", &a, "--out-dir", &o])
+                    let r = engine_json(&bin, &dir, &["listen", "--asset", &a, "--out-dir", &o]);
+                    if r.is_ok() {
+                        // Reveal the audio folder in Finder so it can be played.
+                        let _ = std::process::Command::new("open")
+                            .arg(&out_dir_for_reveal)
+                            .spawn();
+                    }
+                    r
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -318,7 +328,7 @@ impl ReaderPanel {
                             .and_then(|c| c.as_array())
                             .map(|a| a.len())
                             .unwrap_or(0);
-                        format!("Narrated {n} chapter(s) → {shown}").into()
+                        format!("Narrated {n} chapter(s) — revealed in Finder ({shown})").into()
                     }
                     Err(e) => format!("Narrate failed: {e}").into(),
                 };
