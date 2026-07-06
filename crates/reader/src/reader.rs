@@ -319,6 +319,12 @@ impl Panel for ReaderPanel {
         px(440.)
     }
 
+    /// Zen PDF is the reason this build exists, so the panel is visible by
+    /// default in a fresh workspace (users can still toggle it with cmd-k cmd-r).
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
+        true
+    }
+
     fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
         Some(ui::IconName::File)
     }
@@ -332,7 +338,10 @@ impl Panel for ReaderPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        5
+        // Must be globally unique across panels (Zed panics otherwise). In use:
+        // 0 agent · 1 project · 2 terminal · 3 git · 5 collab · 6 outline ·
+        // 7 debugger. 4 is free and keeps Zen PDF ordered near the file panels.
+        4
     }
 }
 
