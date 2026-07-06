@@ -2,26 +2,26 @@
 //!
 //! A calm document workspace docked in Zed. The panel is a thin client: it
 //! drives the offline engine (`reader-engined`) over a subprocess boundary and
-//! renders the results. That boundary is deliberate — it keeps the engine's
-//! SQLite out of Zed's link graph (avoiding the libsqlite3-sys conflict) and
-//! lets the same backend serve the CLI / API / Docker surfaces later.
+//! renders the results, opening produced artifacts (extracted text, rendered
+//! pages) as ordinary Zed tabs so they get search / editing / diff for free.
 //!
-//! Milestone: import documents and list them from the real engine. Page
-//! viewing, Edit-bucket mutations, and git-diff hang off Zed's own machinery
-//! (editor / multi_buffer / git_ui) from here.
+//! The tool surface is contextual: select a document and its available actions
+//! appear as a toolbar. Not-yet-built tools (OCR without models, compression,
+//! deskew) are shown as disabled controls with an honest label rather than
+//! hidden — the surface reflects reality.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use gpui::{
-    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Pixels, Render, SharedString,
-    Styled, WeakEntity, Window, actions, div, px,
+    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Pixels, Render,
+    SharedString, Styled, WeakEntity, Window, actions, div, px,
 };
 use serde_json::Value;
 use ui::prelude::*;
 use workspace::{
-    Workspace,
+    OpenOptions, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -48,6 +48,7 @@ struct Doc {
 
 pub struct ReaderPanel {
     focus_handle: FocusHandle,
+    workspace: WeakEntity<Workspace>,
     /// Path to the `reader-engined` backend binary.
     engine_bin: PathBuf,
     /// Library data directory (the backend appends `library.midasdoc`).
@@ -58,17 +59,20 @@ pub struct ReaderPanel {
     busy: bool,
     /// Human-readable capability summary (say / render / OCR / Kokoro).
     capabilities: Option<SharedString>,
+    /// Whether the OCR runtime + models are installed (enables the OCR tool).
+    ocr_available: bool,
 }
 
 impl ReaderPanel {
     pub async fn load(
-        _workspace: WeakEntity<Workspace>,
+        workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         cx.update(|_window, cx| {
             cx.new(|cx| {
                 let mut panel = ReaderPanel {
                     focus_handle: cx.focus_handle(),
+                    workspace,
                     engine_bin: resolve_engine_bin(),
                     data_dir: resolve_data_dir(),
                     documents: Vec::new(),
@@ -76,6 +80,7 @@ impl ReaderPanel {
                     status: "Starting the engine…".into(),
                     busy: false,
                     capabilities: None,
+                    ocr_available: false,
                 };
                 panel.refresh(cx);
                 panel.load_capabilities(cx);
@@ -99,6 +104,9 @@ impl ReaderPanel {
                 match result {
                     Ok(value) => {
                         this.documents = parse_docs(&value);
+                        if this.selected.is_none() {
+                            this.selected = this.documents.first().map(|d| d.id);
+                        }
                         this.status = match this.documents.len() {
                             0 => "No documents yet — Import a PDF to begin.".into(),
                             1 => "1 document".into(),
@@ -124,6 +132,11 @@ impl ReaderPanel {
                 .await;
             if let Ok(value) = result {
                 this.update(cx, |this, cx| {
+                    this.ocr_available = value
+                        .get("ocr")
+                        .and_then(|o| o.get("available"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     this.capabilities = Some(summarize_capabilities(&value));
                     cx.notify();
                 })
@@ -197,6 +210,198 @@ impl ReaderPanel {
         })
         .detach();
     }
+
+    // --- contextual tools (operate on the selected document) ----------------
+
+    /// Extract the text layer to a sidecar and open it as a Zed tab.
+    fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        let out = std::env::temp_dir().join(format!("zenpdf-asset{asset}.txt"));
+        let out_engine = out.clone();
+        let ws = self.workspace.clone();
+        self.begin("Extracting text…", cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let a = asset.to_string();
+                    let o = out_engine.to_string_lossy().to_string();
+                    engine_json(&bin, &dir, &["doc-text", "--asset", &a, "--out", &o])
+                })
+                .await;
+            let ok = result.is_ok();
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(v) => {
+                        let chars = v.get("chars").and_then(|c| c.as_i64()).unwrap_or(0);
+                        format!("Extracted {chars} characters — opening…").into()
+                    }
+                    Err(e) => format!("Extract failed: {e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+            if ok {
+                ws.update_in(cx, |ws, window, cx| {
+                    ws.open_abs_path(out.clone(), OpenOptions::default(), window, cx)
+                        .detach();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Render page 1 of the selected document and open the PNG as a Zed tab.
+    fn view_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        let out = std::env::temp_dir().join(format!("zenpdf-asset{asset}-p1.png"));
+        let out_engine = out.clone();
+        let ws = self.workspace.clone();
+        self.begin("Rendering page…", cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let a = asset.to_string();
+                    let o = out_engine.to_string_lossy().to_string();
+                    engine_json(
+                        &bin,
+                        &dir,
+                        &["render-asset", "--asset", &a, "--page", "0", "--dpi", "150", "--out", &o],
+                    )
+                })
+                .await;
+            let ok = result.is_ok();
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(_) => "Rendered page 1 — opening…".into(),
+                    Err(e) => format!("Render failed: {e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+            if ok {
+                ws.update_in(cx, |ws, window, cx| {
+                    ws.open_abs_path(out.clone(), OpenOptions::default(), window, cx)
+                        .detach();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Narrate the selected document to chaptered audio files.
+    fn narrate(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        let out_dir = std::env::temp_dir().join(format!("zenpdf-audio-asset{asset}"));
+        let shown = out_dir.to_string_lossy().to_string();
+        self.begin("Narrating to audio…", cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let a = asset.to_string();
+                    let o = out_dir.to_string_lossy().to_string();
+                    engine_json(&bin, &dir, &["listen", "--asset", &a, "--out-dir", &o])
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(v) => {
+                        let n = v
+                            .get("chapters")
+                            .and_then(|c| c.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        format!("Narrated {n} chapter(s) → {shown}").into()
+                    }
+                    Err(e) => format!("Narrate failed: {e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A no-argument engine mutation (combine / split / rotate) reported in
+    /// the status line. `verb` is shown while running; `ok_label` on success.
+    fn run_op(&mut self, verb: &str, args: Vec<String>, ok_label: &'static str, cx: &mut Context<Self>) {
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        self.begin(verb, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    engine_json(&bin, &dir, &refs)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(_) => ok_label.into(),
+                    Err(e) => format!("{ok_label} failed: {e}").into(),
+                };
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn combine_all(&mut self, cx: &mut Context<Self>) {
+        self.run_op(
+            "Combining all documents…",
+            vec!["combine".into(), "--name".into(), "all".into()],
+            "Combined into one PDF.",
+            cx,
+        );
+    }
+
+    fn split_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_op(
+            "Splitting into pages…",
+            vec![
+                "split".into(),
+                "--asset".into(),
+                asset.to_string(),
+                "--prefix".into(),
+                "split".into(),
+            ],
+            "Split into per-page PDFs.",
+            cx,
+        );
+    }
+
+    fn rotate_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_op(
+            "Rotating 90°…",
+            vec![
+                "rotate".into(),
+                "--asset".into(),
+                asset.to_string(),
+                "--degrees".into(),
+                "90".into(),
+                "--output".into(),
+                "rotated".into(),
+            ],
+            "Rotated 90° into a new PDF.",
+            cx,
+        );
+    }
+
+    fn begin(&mut self, msg: &str, cx: &mut Context<Self>) {
+        self.busy = true;
+        self.status = msg.to_string().into();
+        cx.notify();
+    }
 }
 
 /// Resolve the backend binary: `$READER_ENGINED`, else `reader-engined` on PATH.
@@ -218,7 +423,7 @@ fn resolve_data_dir() -> PathBuf {
 }
 
 /// Run the engine and parse its stdout JSON. Blocking — call from a background
-/// task. On non-zero exit, surface the engine's stderr JSON error.
+/// task. On non-zero exit, surface the engine's stderr message.
 fn engine_json(bin: &Path, data_dir: &Path, args: &[&str]) -> Result<Value> {
     let output = std::process::Command::new(bin)
         .arg("--data-dir")
@@ -264,28 +469,21 @@ fn parse_docs(value: &Value) -> Vec<Doc> {
 }
 
 fn summarize_capabilities(value: &Value) -> SharedString {
-    let say = value.get("say").and_then(|v| v.as_bool()).unwrap_or(false);
-    let render = value
-        .get("render_pdf")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let ocr = value
-        .get("ocr")
-        .and_then(|o| o.get("available"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let kokoro = value
-        .get("tts")
-        .and_then(|t| t.get("available"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let flag = |key: &str| value.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let nested = |key: &str| {
+        value
+            .get(key)
+            .and_then(|o| o.get("available"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
     let mark = |on: bool| if on { "on" } else { "—" };
     format!(
         "Voice {} · Render {} · OCR {} · Kokoro {}",
-        mark(say),
-        mark(render),
-        mark(ocr),
-        mark(kokoro)
+        mark(flag("say")),
+        mark(flag("render_pdf")),
+        mark(nested("ocr")),
+        mark(nested("tts"))
     )
     .into()
 }
@@ -360,6 +558,8 @@ impl Render for ReaderPanel {
         let panel_bg = colors.panel_background;
         let elevated = colors.elevated_surface_background;
         let selected_bg = colors.element_selected;
+        let has_selection = self.selected.is_some();
+        let ocr_available = self.ocr_available;
 
         // --- header: wordmark + quiet subtitle + Import -----------------------
         let header = v_flex()
@@ -440,8 +640,79 @@ impl Render for ReaderPanel {
             }
         }
 
+        // --- contextual tools (only when a document is selected) --------------
+        let toolbar = if has_selection {
+            let ocr_label = if ocr_available {
+                "OCR"
+            } else {
+                "OCR (needs models)"
+            };
+            Some(
+                v_flex()
+                    .gap_1()
+                    .mt_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        Label::new("Tools")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .child(Button::new("t-extract", "Extract text").on_click(
+                                cx.listener(|this, _, window, cx| this.extract_text(window, cx)),
+                            ))
+                            .child(Button::new("t-view", "View page").on_click(cx.listener(
+                                |this, _, window, cx| this.view_page(window, cx),
+                            )))
+                            .child(
+                                Button::new("t-narrate", "Narrate").on_click(
+                                    cx.listener(|this, _, _, cx| this.narrate(cx)),
+                                ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .child(
+                                Button::new("t-combine", "Combine").on_click(
+                                    cx.listener(|this, _, _, cx| this.combine_all(cx)),
+                                ),
+                            )
+                            .child(
+                                Button::new("t-split", "Split").on_click(
+                                    cx.listener(|this, _, _, cx| this.split_selected(cx)),
+                                ),
+                            )
+                            .child(Button::new("t-rotate", "Rotate 90°").on_click(
+                                cx.listener(|this, _, _, cx| this.rotate_selected(cx)),
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .child(Button::new("t-ocr", ocr_label).disabled(!ocr_available))
+                            .child(Button::new("t-compress", "Compress (soon)").disabled(true))
+                            .child(Button::new("t-deskew", "Deskew (soon)").disabled(true)),
+                    ),
+            )
+        } else {
+            None
+        };
+
         // --- status footer ----------------------------------------------------
-        let mut footer = v_flex().gap_0p5().mt_2().pt_2().border_t_1().border_color(border);
+        let mut footer = v_flex()
+            .gap_0p5()
+            .mt_2()
+            .pt_2()
+            .border_t_1()
+            .border_color(border);
         footer = footer.child(
             Label::new(self.status.clone())
                 .size(LabelSize::Small)
@@ -461,6 +732,16 @@ impl Render for ReaderPanel {
             .size_full()
             .bg(panel_bg)
             .p_4()
-            .child(v_flex().size_full().child(header).child(list).child(footer))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.import_paths(paths.paths().to_vec(), cx);
+            }))
+            .child(
+                v_flex()
+                    .size_full()
+                    .child(header)
+                    .child(list)
+                    .when_some(toolbar, |el, tb| el.child(tb))
+                    .child(footer),
+            )
     }
 }
