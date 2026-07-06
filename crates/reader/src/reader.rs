@@ -474,11 +474,29 @@ impl ReaderPanel {
     }
 }
 
-/// Resolve the backend binary: `$READER_ENGINED`, else `reader-engined` on PATH.
+/// Resolve the backend binary so the app works when launched normally (no env
+/// var required). Order: `$READER_ENGINED`, then next to the running executable
+/// (self-contained: we ship `reader-engined` beside `zed`), then a couple of
+/// dev-build locations, then `reader-engined` on `PATH`.
 fn resolve_engine_bin() -> PathBuf {
-    std::env::var_os("READER_ENGINED")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("reader-engined"))
+    if let Some(p) = std::env::var_os("READER_ENGINED") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Bundled beside the binary (release / .app Contents/MacOS).
+            let beside = dir.join("reader-engined");
+            if beside.is_file() {
+                return beside;
+            }
+            // Dev: zed/target/debug/zed → ../../../target/debug/reader-engined
+            let dev = dir.join("../../../target/debug/reader-engined");
+            if dev.is_file() {
+                return dev;
+            }
+        }
+    }
+    PathBuf::from("reader-engined")
 }
 
 /// Resolve the library directory: `$READER_DATA_DIR`, else the app-support dir.
