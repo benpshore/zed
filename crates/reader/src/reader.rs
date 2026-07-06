@@ -26,13 +26,85 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-actions!(reader, [ToggleFocus]);
+actions!(
+    reader,
+    [
+        ToggleFocus,
+        Import,
+        ExtractText,
+        Ocr,
+        ViewPage,
+        Narrate,
+        Combine,
+        Split,
+        Rotate,
+        Compress,
+        Deskew,
+        Normalize,
+    ]
+);
 
-/// Register the Reader panel's actions on every workspace.
+/// Register the Reader panel's actions on every workspace so the app menu can
+/// drive the tools (they act on the panel's selected document).
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ReaderPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &Import, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.open_files(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &ExtractText, window, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.extract_text(window, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Ocr, window, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.ocr_selected(window, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &ViewPage, window, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.view_page(window, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Narrate, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.narrate(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Combine, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.combine_all(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Split, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.split_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Rotate, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.rotate_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Compress, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.compress_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Deskew, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.deskew_selected(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &Normalize, _, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.normalize_selected(cx));
+            }
         });
     })
     .detach();
@@ -611,6 +683,66 @@ impl ReaderPanel {
         );
     }
 
+    /// Run an engine command that writes a PDF to `out`, then open it (Preview).
+    fn run_pdf_tool(&mut self, verb: &str, args: Vec<String>, cx: &mut Context<Self>) {
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        self.begin(verb, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    let r = engine_json(&bin, &dir, &refs);
+                    if let Ok(v) = &r {
+                        if let Some(out) = v.get("out").and_then(|o| o.as_str()) {
+                            let _ = std::process::Command::new("/usr/bin/open").arg(out).spawn();
+                        }
+                    }
+                    r
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(v) => {
+                        let out = v.get("out").and_then(|o| o.as_str()).unwrap_or("");
+                        format!("Done — opened {out}").into()
+                    }
+                    Err(e) => format!("Failed: {e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn compress_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_pdf_tool(
+            "Compressing…",
+            vec!["compress".into(), "--asset".into(), asset.to_string()],
+            cx,
+        );
+    }
+
+    fn deskew_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_pdf_tool(
+            "Deskewing…",
+            vec!["deskew".into(), "--asset".into(), asset.to_string()],
+            cx,
+        );
+    }
+
+    fn normalize_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self.selected else { return };
+        self.run_pdf_tool(
+            "Normalizing to Letter…",
+            vec!["normalize".into(), "--asset".into(), asset.to_string()],
+            cx,
+        );
+    }
+
     fn begin(&mut self, msg: &str, cx: &mut Context<Self>) {
         self.busy = true;
         self.status = msg.to_string().into();
@@ -790,8 +922,6 @@ impl Render for ReaderPanel {
         let panel_bg = colors.panel_background;
         let elevated = colors.elevated_surface_background;
         let selected_bg = colors.element_selected;
-        let has_selection = self.selected.is_some();
-        let ocr_available = self.ocr_available;
         let playing = self.playing;
         let has_audio = !self.played_chapters.is_empty();
         let n_chapters = self.played_chapters.len();
@@ -875,77 +1005,6 @@ impl Render for ReaderPanel {
             }
         }
 
-        // --- contextual tools (only when a document is selected) --------------
-        let toolbar = if has_selection {
-            let ocr_label = if ocr_available {
-                "OCR"
-            } else {
-                "OCR (needs models)"
-            };
-            Some(
-                v_flex()
-                    .gap_1()
-                    .mt_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        Label::new("Tools")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .flex_wrap()
-                            .child(Button::new("t-extract", "Extract text").on_click(
-                                cx.listener(|this, _, window, cx| this.extract_text(window, cx)),
-                            ))
-                            .child(Button::new("t-view", "View page").on_click(cx.listener(
-                                |this, _, window, cx| this.view_page(window, cx),
-                            )))
-                            .child(
-                                Button::new("t-narrate", "Narrate").on_click(
-                                    cx.listener(|this, _, _, cx| this.narrate(cx)),
-                                ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .flex_wrap()
-                            .child(
-                                Button::new("t-combine", "Combine").on_click(
-                                    cx.listener(|this, _, _, cx| this.combine_all(cx)),
-                                ),
-                            )
-                            .child(
-                                Button::new("t-split", "Split").on_click(
-                                    cx.listener(|this, _, _, cx| this.split_selected(cx)),
-                                ),
-                            )
-                            .child(Button::new("t-rotate", "Rotate 90°").on_click(
-                                cx.listener(|this, _, _, cx| this.rotate_selected(cx)),
-                            )),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .flex_wrap()
-                            .child(
-                                Button::new("t-ocr", ocr_label)
-                                    .disabled(!ocr_available)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.ocr_selected(window, cx)
-                                    })),
-                            )
-                            .child(Button::new("t-compress", "Compress (soon)").disabled(true))
-                            .child(Button::new("t-deskew", "Deskew (soon)").disabled(true)),
-                    ),
-            )
-        } else {
-            None
-        };
 
         // --- library search ----------------------------------------------------
         let mut search_section = v_flex()
@@ -1056,7 +1115,6 @@ impl Render for ReaderPanel {
                     .size_full()
                     .child(header)
                     .child(list)
-                    .when_some(toolbar, |el, tb| el.child(tb))
                     .child(search_section)
                     .when_some(play_controls, |el, pc| el.child(pc))
                     .child(footer),

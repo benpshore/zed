@@ -143,6 +143,32 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             ],
         },
         Menu {
+            name: "Zen PDF".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("Show Panel", reader::ToggleFocus),
+                MenuItem::action("Import…", reader::Import),
+                MenuItem::separator(),
+                MenuItem::action("View Page", reader::ViewPage),
+                MenuItem::action("Extract Text", reader::ExtractText),
+                MenuItem::action("Recognize Text (OCR)", reader::Ocr),
+                MenuItem::action("Narrate to Audio", reader::Narrate),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu {
+                    name: "Edit Document".into(),
+                    disabled: false,
+                    items: vec![
+                        MenuItem::action("Combine", reader::Combine),
+                        MenuItem::action("Split", reader::Split),
+                        MenuItem::action("Rotate 90°", reader::Rotate),
+                        MenuItem::action("Normalize to Letter", reader::Normalize),
+                        MenuItem::action("Deskew", reader::Deskew),
+                        MenuItem::action("Compress", reader::Compress),
+                    ],
+                }),
+            ],
+        },
+        Menu {
             name: "Edit".into(),
             disabled: false,
             items: vec![
