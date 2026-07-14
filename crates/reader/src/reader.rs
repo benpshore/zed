@@ -58,6 +58,10 @@ pub fn init(cx: &mut App) {
     // Default selection so the Contents panel can read the global before any
     // document is picked.
     cx.set_global(ZenSelection::default());
+    // Claim document files in the project-item registry: a PDF opened from
+    // ANY route (Finder, drop, project tree, CLI) becomes a DocumentView.
+    // Registered after editor::init — last registration wins the path claim.
+    workspace::register_project_item::<DocumentView>(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ReaderPanel>(window, cx);
@@ -82,6 +86,15 @@ pub fn init(cx: &mut App) {
                 }
             },
         );
+        // Same routing for opens that arrive with no focus (Finder
+        // double-click, dock drops, `open` CLI): a direct workspace hook —
+        // action dispatch is focus-dependent and silently drops otherwise.
+        workspace.set_document_opener(Box::new(|workspace, paths, window, cx| {
+            if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                workspace.open_panel::<ReaderPanel>(window, cx);
+                panel.update(cx, |panel, cx| panel.import_paths(paths, cx));
+            }
+        }));
         workspace.register_action(|workspace, _: &ExtractText, window, cx| {
             if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.extract_text(window, cx));
@@ -468,6 +481,7 @@ impl ReaderPanel {
                     let view = cx.new(|cx| DocumentView {
                         filename,
                         pages,
+                        status: "".into(),
                         focus_handle: cx.focus_handle(),
                     });
                     ws.add_item_to_active_pane(Box::new(view), None, true, window, cx);
@@ -1072,13 +1086,131 @@ fn resolve_data_dir() -> PathBuf {
 // ============================================================================
 // Document view: the center-pane page display. A reader's main surface shows
 // PAGES, not "binary files are not supported".
+//
+// DocumentView is ALSO registered as a project item (like the image viewer),
+// so a PDF/Word/slides file opened from ANY route — Finder, drag-drop,
+// project tree, `open` CLI — lands here instead of a dead binary-file tab.
 // ============================================================================
+
+/// A document file claimed from the project-item registry.
+pub struct DocumentItem {
+    abs_path: PathBuf,
+}
+
+impl project::ProjectItem for DocumentItem {
+    fn try_open(
+        project: &Entity<project::Project>,
+        path: &project::ProjectPath,
+        cx: &mut App,
+    ) -> Option<gpui::Task<Result<Entity<Self>>>> {
+        let abs_path = project.read(cx).absolute_path(path, cx)?;
+        if !workspace::invalid_item_view::is_reader_document(&abs_path) {
+            return None;
+        }
+        Some(gpui::Task::ready(Ok(cx.new(|_| DocumentItem { abs_path }))))
+    }
+
+    fn entry_id(&self, _: &App) -> Option<project::ProjectEntryId> {
+        None
+    }
+
+    fn project_path(&self, _: &App) -> Option<project::ProjectPath> {
+        None
+    }
+
+    fn is_dirty(&self) -> bool {
+        false
+    }
+}
 
 pub struct DocumentView {
     filename: SharedString,
     /// Rendered page PNGs, in page order (engine render-cache).
     pages: Vec<PathBuf>,
+    /// Progress / failure text shown while `pages` is empty.
+    status: SharedString,
     focus_handle: FocusHandle,
+}
+
+impl workspace::ProjectItem for DocumentView {
+    type Item = DocumentItem;
+
+    fn for_project_item(
+        _project: Entity<project::Project>,
+        _pane: Option<&workspace::Pane>,
+        item: Entity<DocumentItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let abs_path = item.read(cx).abs_path.clone();
+        let filename: SharedString = abs_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Document".into())
+            .into();
+        let (bin, dir) = (resolve_engine_bin(), resolve_data_dir());
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move {
+                    // Stage-copy via the app's own file-access grant, then
+                    // import (content-addressed: re-opens dedupe cleanly).
+                    let staged = stage_copy(&dir.join("incoming"), &abs_path)?;
+                    let imported =
+                        engine_json(&bin, &dir, &["import", "--file", &staged.to_string_lossy()]);
+                    let _ = std::fs::remove_file(&staged);
+                    let imported = imported?;
+                    let asset = imported
+                        .get("asset_id")
+                        .and_then(|a| a.as_i64())
+                        .ok_or_else(|| anyhow::anyhow!("import returned no asset_id"))?;
+                    let page_count = imported
+                        .get("page_count")
+                        .and_then(|p| p.as_i64())
+                        .unwrap_or(1)
+                        .max(1);
+                    let cache = dir.join("render-cache").join(format!("asset{asset}"));
+                    std::fs::create_dir_all(&cache)?;
+                    let mut rendered = Vec::new();
+                    for p in 0..page_count {
+                        let out = cache.join(format!("p{p}.png"));
+                        if !out.is_file() {
+                            let (a, pg, o) =
+                                (asset.to_string(), p.to_string(), out.to_string_lossy().to_string());
+                            engine_json(
+                                &bin,
+                                &dir,
+                                &["render-asset", "--asset", &a, "--page", &pg, "--dpi", "150",
+                                  "--out", &o],
+                            )?;
+                        }
+                        rendered.push(out);
+                    }
+                    anyhow::Ok(rendered)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(pages) => {
+                        this.pages = pages;
+                        this.status = "".into();
+                    }
+                    Err(e) => {
+                        this.status = format!("Could not open this document: {e:#}").into();
+                        log_line(&resolve_data_dir(), &format!("DocumentView failed: {e:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        Self {
+            filename,
+            pages: Vec::new(),
+            status: "Importing and rendering pages…".into(),
+            focus_handle: cx.focus_handle(),
+        }
+    }
 }
 
 impl EventEmitter<()> for DocumentView {}
@@ -1100,6 +1232,13 @@ impl workspace::Item for DocumentView {
 impl Render for DocumentView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut pages = v_flex().gap_4().p_4().items_center().w_full();
+        if self.pages.is_empty() {
+            pages = pages.child(
+                div().py_8().child(
+                    Label::new(self.status.clone()).color(Color::Muted),
+                ),
+            );
+        }
         for (i, page) in self.pages.iter().enumerate() {
             pages = pages.child(
                 gpui::img(page.clone())

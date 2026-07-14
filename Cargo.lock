@@ -14863,6 +14863,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "project",
  "serde_json",
  "ui",
  "ui_input",

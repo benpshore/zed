@@ -1354,8 +1354,16 @@ struct DispatchingKeystrokes {
 /// A `Workspace` usually consists of 1 or more projects, a central pane group, 3 docks and a status bar.
 /// The `Workspace` owns everybody's state and serves as a default, "global context",
 /// that can be used to register a global action to be triggered from any place in the window.
+/// Direct hook for routing document files (PDF, Word, …) to a document
+/// library instead of opening them as buffers/worktrees. Registered by the
+/// reader's init; called synchronously from `open_paths` — deliberately NOT an
+/// action dispatch, which depends on the focus path and can vanish silently.
+pub type DocumentOpener =
+    Box<dyn Fn(&mut Workspace, Vec<PathBuf>, &mut Window, &mut Context<Workspace>) + 'static>;
+
 pub struct Workspace {
     weak_self: WeakEntity<Self>,
+    document_opener: Option<Rc<DocumentOpener>>,
     workspace_actions: Vec<Box<dyn Fn(Div, &Workspace, &mut Window, &mut Context<Self>) -> Div>>,
     zoomed: Option<AnyWeakView>,
     previous_dock_drag_coordinates: Option<Point<Pixels>>,
@@ -1807,6 +1815,7 @@ impl Workspace {
 
         Workspace {
             weak_self: weak_handle.clone(),
+            document_opener: None,
             zoomed: None,
             zoomed_position: None,
             previous_dock_drag_coordinates: None,
@@ -3633,6 +3642,11 @@ impl Workspace {
     }
 
     #[allow(clippy::type_complexity)]
+    /// Register the document-library opener (see [`DocumentOpener`]).
+    pub fn set_document_opener(&mut self, opener: DocumentOpener) {
+        self.document_opener = Some(Rc::new(opener));
+    }
+
     pub fn open_paths(
         &mut self,
         mut abs_paths: Vec<PathBuf>,
@@ -3646,18 +3660,19 @@ impl Workspace {
         // Reader documents (PDF, Word, slides, …) are library content, never
         // project roots or editor buffers: dropping one on the window must not
         // mount it as a worktree or dead-end in a "binary file" tab. Route
-        // them to the reader's import action and open only what remains.
-        let reader_docs: Vec<PathBuf> = abs_paths
-            .iter()
-            .filter(|p| crate::invalid_item_view::is_reader_document(p))
-            .cloned()
-            .collect();
-        if !reader_docs.is_empty() {
-            abs_paths.retain(|p| !crate::invalid_item_view::is_reader_document(p));
-            window.dispatch_action(
-                Box::new(zed_actions::ImportIntoReader { paths: reader_docs }),
-                cx,
-            );
+        // them through the registered document opener and open only what
+        // remains. (A direct call, not an action dispatch — dispatch depends
+        // on the focus path and silently drops when nothing is focused.)
+        if let Some(opener) = self.document_opener.clone() {
+            let reader_docs: Vec<PathBuf> = abs_paths
+                .iter()
+                .filter(|p| crate::invalid_item_view::is_reader_document(p))
+                .cloned()
+                .collect();
+            if !reader_docs.is_empty() {
+                abs_paths.retain(|p| !crate::invalid_item_view::is_reader_document(p));
+                opener(self, reader_docs, window, cx);
+            }
         }
 
         let caller_ordered_abs_paths = abs_paths.clone();

@@ -730,6 +730,10 @@ fn main() {
 
         editor::init(cx);
         image_viewer::init(cx);
+        // After editor::init — the project-item registry prefers the LAST
+        // registration, and reader must beat the editor's claim-everything
+        // buffer opener for document files (pdf/docx/pptx/epub).
+        reader::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 
