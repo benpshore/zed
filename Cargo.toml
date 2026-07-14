@@ -349,8 +349,8 @@ gpui = { path = "crates/gpui", default-features = false }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }
 # runtime_shaders: compile Metal shaders at runtime, not via build-time `xcrun
-# metal` (full Xcode). Lets the fork build with Command Line Tools only and on
-# Claude Code web. No-op off macOS.
+# metal` (full Xcode). Lets the fork build with Command Line Tools only and in
+# headless CI environments. No-op off macOS.
 gpui_macos = { path = "crates/gpui_macos", default-features = false, features = ["runtime_shaders"] }
 gpui_macros = { path = "crates/gpui_macros" }
 gpui_platform = { path = "crates/gpui_platform", default-features = false }
