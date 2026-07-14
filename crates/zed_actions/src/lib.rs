@@ -20,6 +20,15 @@ pub struct OpenBrowser {
     pub url: Arc<str>,
 }
 
+/// Imports document files (PDF, Word, slides, …) into the reader panel's
+/// library instead of opening them as text buffers.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = reader)]
+#[serde(deny_unknown_fields)]
+pub struct ImportIntoReader {
+    pub paths: Vec<std::path::PathBuf>,
+}
+
 /// Opens a zed:// URL within the application.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = zed)]

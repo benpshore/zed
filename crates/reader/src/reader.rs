@@ -70,6 +70,18 @@ pub fn init(cx: &mut App) {
                 panel.update(cx, |panel, cx| panel.open_files(cx));
             }
         });
+        // Document files opened/dropped into the editor surface get routed to
+        // the library instead of a dead "binary files" tab.
+        workspace.register_action(
+            |workspace, action: &zed_actions::ImportIntoReader, window, cx| {
+                if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
+                    workspace.open_panel::<ReaderPanel>(window, cx);
+                    panel.update(cx, |panel, cx| {
+                        panel.import_paths(action.paths.clone(), cx)
+                    });
+                }
+            },
+        );
         workspace.register_action(|workspace, _: &ExtractText, window, cx| {
             if let Some(panel) = workspace.panel::<ReaderPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.extract_text(window, cx));
@@ -331,7 +343,14 @@ impl ReaderPanel {
     }
 
     /// Import each path through the engine, then refresh the list.
-    fn import_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    ///
+    /// Files are first copied into `<library>/incoming/` BY THIS PROCESS: the
+    /// app holds the user's file-access grant (from the open panel or a drag),
+    /// while the engine subprocess may be denied by macOS privacy protection
+    /// on ~/Documents, ~/Downloads, etc. Importing the staged copy sidesteps
+    /// that entirely; the staged file is removed after import (the engine
+    /// content-addresses it into its own store).
+    pub fn import_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if paths.is_empty() {
             return;
         }
@@ -344,22 +363,39 @@ impl ReaderPanel {
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move {
+                    let staging = dir.join("incoming");
                     let mut imported = 0usize;
-                    let mut last_err: Option<String> = None;
+                    let mut errors: Vec<String> = Vec::new();
                     for path in &paths {
-                        let file = path.to_string_lossy().to_string();
+                        let display = path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string_lossy().to_string());
+                        let staged = match stage_copy(&staging, path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log_line(&dir, &format!("stage-copy FAILED {display}: {e}"));
+                                errors.push(format!("{display}: {e}"));
+                                continue;
+                            }
+                        };
+                        let file = staged.to_string_lossy().to_string();
                         match engine_json(&bin, &dir, &["import", "--file", &file]) {
                             Ok(_) => imported += 1,
-                            Err(e) => last_err = Some(format!("{e}")),
+                            Err(e) => errors.push(format!("{display}: {e}")),
                         }
+                        let _ = std::fs::remove_file(&staged);
                     }
-                    (imported, last_err)
+                    (imported, errors)
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let (imported, last_err) = outcome;
-                if let Some(err) = last_err {
-                    this.status = format!("Imported {imported}/{n} · {err}").into();
+                let (imported, errors) = outcome;
+                if let Some(first_err) = errors.first() {
+                    this.status = format!(
+                        "Imported {imported}/{n} — {first_err} (details: panel.log in the library folder)"
+                    )
+                    .into();
                 } else {
                     this.status = format!("Imported {imported} document(s).").into();
                 }
@@ -370,11 +406,23 @@ impl ReaderPanel {
         .detach();
     }
 
+    /// The selected asset, or a LOUD status message when there is none — a
+    /// tool invoked with nothing selected must never be a silent no-op.
+    fn require_selected(&mut self, cx: &mut Context<Self>) -> Option<i64> {
+        let sel = self.selected;
+        if sel.is_none() {
+            self.status = "Select a document in the list first.".into();
+            log_line(&self.data_dir, "tool invoked with no document selected");
+            cx.notify();
+        }
+        sel
+    }
+
     // --- contextual tools (operate on the selected document) ----------------
 
     /// Extract the text layer to a sidecar and open it as a Zed tab.
     fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
         let out = std::env::temp_dir().join(format!("zenpdf-asset{asset}.txt"));
         let out_engine = out.clone();
@@ -434,7 +482,7 @@ impl ReaderPanel {
 
     /// Force on-device OCR of the selected document and open the text as a tab.
     fn ocr_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
         let out = std::env::temp_dir().join(format!("zenpdf-asset{asset}-ocr.txt"));
         let out_engine = out.clone();
@@ -474,7 +522,7 @@ impl ReaderPanel {
 
     /// Render page 1 of the selected document and open the PNG as a Zed tab.
     fn view_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
         let out = std::env::temp_dir().join(format!("zenpdf-asset{asset}-p1.png"));
         let out_engine = out.clone();
@@ -516,7 +564,7 @@ impl ReaderPanel {
     /// Narrate the selected document to chaptered audio files, written to a
     /// findable folder and revealed in Finder so it can be played.
     fn narrate(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
         // A stable, reachable location under the library — not a hidden temp dir.
         let out_dir = self.data_dir.join("audio").join(format!("asset{asset}"));
@@ -712,7 +760,7 @@ impl ReaderPanel {
     }
 
     fn split_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_op(
             "Splitting into pages…",
             vec![
@@ -728,7 +776,7 @@ impl ReaderPanel {
     }
 
     fn rotate_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_op(
             "Rotating 90°…",
             vec![
@@ -779,7 +827,7 @@ impl ReaderPanel {
     }
 
     fn compress_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_pdf_tool(
             "Compressing…",
             vec!["compress".into(), "--asset".into(), asset.to_string()],
@@ -788,7 +836,7 @@ impl ReaderPanel {
     }
 
     fn deskew_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_pdf_tool(
             "Deskewing…",
             vec!["deskew".into(), "--asset".into(), asset.to_string()],
@@ -797,7 +845,7 @@ impl ReaderPanel {
     }
 
     fn normalize_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_pdf_tool(
             "Normalizing to Letter…",
             vec!["normalize".into(), "--asset".into(), asset.to_string()],
@@ -834,7 +882,7 @@ impl ReaderPanel {
     }
 
     fn device_render(&mut self, target: &str, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_pdf_tool(
             "Re-rendering for device…",
             vec![
@@ -849,7 +897,7 @@ impl ReaderPanel {
     }
 
     fn split_by_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_status(
             "Splitting into chunks…",
             vec!["split-by".into(), "--asset".into(), asset.to_string()],
@@ -862,7 +910,7 @@ impl ReaderPanel {
     }
 
     fn rag_export_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_pdf_tool(
             "Exporting RAG (JSONL)…",
             vec!["rag".into(), "--asset".into(), asset.to_string()],
@@ -871,7 +919,7 @@ impl ReaderPanel {
     }
 
     fn analyze_image_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(asset) = self.selected else { return };
+        let Some(asset) = self.require_selected(cx) else { return };
         self.run_status(
             "Analyzing image…",
             vec!["analyze-image".into(), "--asset".into(), asset.to_string()],
@@ -949,17 +997,58 @@ fn resolve_data_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// Copy `src` into the staging dir (created on demand), keeping its filename.
+/// Runs in the app process, which holds the user's file-access grant.
+fn stage_copy(staging: &Path, src: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(staging)?;
+    let name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", src.display()))?;
+    let dst = staging.join(name);
+    std::fs::copy(src, &dst)
+        .map_err(|e| anyhow::anyhow!("could not read {} ({e})", src.display()))?;
+    Ok(dst)
+}
+
+/// Append one diagnostic line to `<library>/panel.log`. Best-effort — logging
+/// must never break a tool. This is the file to read when a button "did
+/// nothing": every engine call and failure lands here.
+fn log_line(data_dir: &Path, line: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(data_dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("panel.log"))
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ts}] {line}");
+    }
+}
+
 /// Run the engine and parse its stdout JSON. Blocking — call from a background
 /// task. On non-zero exit, surface the engine's stderr message.
 fn engine_json(bin: &Path, data_dir: &Path, args: &[&str]) -> Result<Value> {
+    log_line(data_dir, &format!("engine {}", args.join(" ")));
     let output = std::process::Command::new(bin)
         .arg("--data-dir")
         .arg(data_dir)
         .args(args)
         .output()
-        .map_err(|e| anyhow::anyhow!("could not launch {}: {e}", bin.display()))?;
+        .map_err(|e| {
+            let msg = format!("could not launch {}: {e}", bin.display());
+            log_line(data_dir, &format!("ERROR {msg}"));
+            anyhow::anyhow!("{msg}")
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        log_line(
+            data_dir,
+            &format!("ERROR {} → {}", args.join(" "), stderr.trim()),
+        );
         bail!("{}", stderr.trim());
     }
     let value = serde_json::from_slice(&output.stdout)?;

@@ -75,9 +75,23 @@ impl Focusable for InvalidItemView {
     }
 }
 
+/// Document types the reader library can ingest — these get an "Import into
+/// Reader" affordance instead of only a dead-end error.
+fn is_reader_document(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("pdf" | "docx" | "doc" | "pptx" | "ppt" | "epub")
+    )
+}
+
 impl Render for InvalidItemView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let abs_path = self.abs_path.clone();
+        let import_path = self.abs_path.clone();
+        let importable = self.is_local && is_reader_document(&self.abs_path);
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle(cx))
@@ -96,6 +110,22 @@ impl Render for InvalidItemView {
                                 .justify_center()
                                 .child(Label::new(self.error.clone()).size(LabelSize::Small)),
                         )
+                        .when(importable, |contents| {
+                            contents.child(
+                                h_flex().justify_center().child(
+                                    Button::new("import-into-reader", "Import into Reader")
+                                        .on_click(move |_, window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(zed_actions::ImportIntoReader {
+                                                    paths: vec![import_path.to_path_buf()],
+                                                }),
+                                                cx,
+                                            );
+                                        })
+                                        .style(ButtonStyle::Filled),
+                                ),
+                            )
+                        })
                         .when(self.is_local, |contents| {
                             contents.child(
                                 h_flex().justify_center().child(
