@@ -3643,6 +3643,23 @@ impl Workspace {
     ) -> Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>> {
         let fs = self.app_state.fs.clone();
 
+        // Reader documents (PDF, Word, slides, …) are library content, never
+        // project roots or editor buffers: dropping one on the window must not
+        // mount it as a worktree or dead-end in a "binary file" tab. Route
+        // them to the reader's import action and open only what remains.
+        let reader_docs: Vec<PathBuf> = abs_paths
+            .iter()
+            .filter(|p| crate::invalid_item_view::is_reader_document(p))
+            .cloned()
+            .collect();
+        if !reader_docs.is_empty() {
+            abs_paths.retain(|p| !crate::invalid_item_view::is_reader_document(p));
+            window.dispatch_action(
+                Box::new(zed_actions::ImportIntoReader { paths: reader_docs }),
+                cx,
+            );
+        }
+
         let caller_ordered_abs_paths = abs_paths.clone();
 
         // Sort the paths to ensure we add worktrees for parents before their children.

@@ -406,6 +406,78 @@ impl ReaderPanel {
         .detach();
     }
 
+    /// Render every page of the selected document and show them in a scrollable
+    /// document view in the center pane — clicking a document must SHOW it.
+    fn open_document_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(asset) = self.require_selected(cx) else { return };
+        let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
+        let filename: SharedString = self
+            .documents
+            .iter()
+            .find(|d| d.id == asset)
+            .map(|d| d.filename.clone())
+            .unwrap_or_else(|| "Document".into());
+        let page_count = self
+            .documents
+            .iter()
+            .find(|d| d.id == asset)
+            .and_then(|d| d.pages)
+            .unwrap_or(1)
+            .max(1);
+        let ws = self.workspace.clone();
+        self.begin("Rendering pages…", cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let pages = cx
+                .background_spawn(async move {
+                    let cache = dir.join("render-cache").join(format!("asset{asset}"));
+                    let _ = std::fs::create_dir_all(&cache);
+                    let mut rendered: Vec<PathBuf> = Vec::new();
+                    for p in 0..page_count {
+                        let out = cache.join(format!("p{p}.png"));
+                        if !out.is_file() {
+                            let (a, pg, o) =
+                                (asset.to_string(), p.to_string(), out.to_string_lossy().to_string());
+                            if let Err(e) = engine_json(
+                                &bin,
+                                &dir,
+                                &["render-asset", "--asset", &a, "--page", &pg, "--dpi", "150",
+                                  "--out", &o],
+                            ) {
+                                log_line(&dir, &format!("page {p} render failed: {e}"));
+                                break;
+                            }
+                        }
+                        rendered.push(out);
+                    }
+                    rendered
+                })
+                .await;
+            let n = pages.len();
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = if n == 0 {
+                    "Could not render this document — see panel.log.".into()
+                } else {
+                    format!("Showing {n} page(s).").into()
+                };
+                cx.notify();
+            })
+            .ok();
+            if n > 0 {
+                ws.update_in(cx, |ws, window, cx| {
+                    let view = cx.new(|cx| DocumentView {
+                        filename,
+                        pages,
+                        focus_handle: cx.focus_handle(),
+                    });
+                    ws.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// The selected asset, or a LOUD status message when there is none — a
     /// tool invoked with nothing selected must never be a silent no-op.
     fn require_selected(&mut self, cx: &mut Context<Self>) -> Option<i64> {
@@ -997,6 +1069,56 @@ fn resolve_data_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+// ============================================================================
+// Document view: the center-pane page display. A reader's main surface shows
+// PAGES, not "binary files are not supported".
+// ============================================================================
+
+pub struct DocumentView {
+    filename: SharedString,
+    /// Rendered page PNGs, in page order (engine render-cache).
+    pages: Vec<PathBuf>,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<()> for DocumentView {}
+
+impl Focusable for DocumentView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl workspace::Item for DocumentView {
+    type Event = ();
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.filename.clone()
+    }
+}
+
+impl Render for DocumentView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut pages = v_flex().gap_4().p_4().items_center().w_full();
+        for (i, page) in self.pages.iter().enumerate() {
+            pages = pages.child(
+                gpui::img(page.clone())
+                    .id(("page", i))
+                    .max_w_full()
+                    .shadow_md(),
+            );
+        }
+        div()
+            .id("document-pages")
+            .track_focus(&self.focus_handle(cx))
+            .key_context("DocumentView")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(cx.theme().colors().editor_background)
+            .child(pages)
+    }
+}
+
 /// Copy `src` into the staging dir (created on demand), keeping its filename.
 /// Runs in the app process, which holds the user's file-access grant.
 fn stage_copy(staging: &Path, src: &Path) -> Result<PathBuf> {
@@ -1232,7 +1354,7 @@ impl Render for ReaderPanel {
                         .border_color(border)
                         .bg(if is_selected { selected_bg } else { elevated })
                         .hover(|s| s.bg(selected_bg))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected = Some(id);
                             // Publish the selection so the Contents panel updates.
                             cx.set_global(ZenSelection {
@@ -1243,6 +1365,8 @@ impl Render for ReaderPanel {
                                 data_dir: this.data_dir.clone(),
                             });
                             cx.notify();
+                            // A reader shows the document you clicked.
+                            this.open_document_view(window, cx);
                         }))
                         .child(
                             v_flex()
@@ -1377,10 +1501,44 @@ impl Render for ReaderPanel {
                     .size_full()
                     .child(header)
                     .child(list)
+                    .when(self.selected.is_some(), |el| el.child(self.render_tools_row(cx)))
                     .child(search_section)
                     .when_some(play_controls, |el, pc| el.child(pc))
                     .child(footer),
             )
+    }
+}
+
+impl ReaderPanel {
+    /// Visible, always-discoverable tool buttons for the selected document.
+    /// Menu-only tools proved invisible in practice — a document app's core
+    /// actions live next to the document list.
+    fn render_tools_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_wrap()
+            .gap_1()
+            .mt_2()
+            .child(Button::new("t-view", "View").on_click(cx.listener(
+                |this, _, window, cx| this.open_document_view(window, cx),
+            )))
+            .child(Button::new("t-narrate", "▶ Narrate").on_click(cx.listener(
+                |this, _, _, cx| this.narrate(cx),
+            )))
+            .child(Button::new("t-extract", "Extract text").on_click(cx.listener(
+                |this, _, window, cx| this.extract_text(window, cx),
+            )))
+            .child(Button::new("t-ocr", "OCR").on_click(cx.listener(
+                |this, _, window, cx| this.ocr_selected(window, cx),
+            )))
+            .child(Button::new("t-combine", "Combine").on_click(cx.listener(
+                |this, _, _, cx| this.combine_all(cx),
+            )))
+            .child(Button::new("t-split", "Split").on_click(cx.listener(
+                |this, _, _, cx| this.split_selected(cx),
+            )))
+            .child(Button::new("t-rotate", "Rotate").on_click(cx.listener(
+                |this, _, _, cx| this.rotate_selected(cx),
+            )))
     }
 }
 

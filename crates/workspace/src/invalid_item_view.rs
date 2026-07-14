@@ -75,9 +75,9 @@ impl Focusable for InvalidItemView {
     }
 }
 
-/// Document types the reader library can ingest — these get an "Import into
-/// Reader" affordance instead of only a dead-end error.
-fn is_reader_document(path: &Path) -> bool {
+/// Document types the reader library can ingest — these are library content,
+/// never project roots or editor buffers.
+pub fn is_reader_document(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
