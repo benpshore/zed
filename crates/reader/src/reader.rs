@@ -367,12 +367,12 @@ impl ReaderPanel {
         if paths.is_empty() {
             return;
         }
+        let n = paths.len();
+        if !self.try_begin(&format!("Importing {n} document(s)…"), cx) {
+            return;
+        }
         let bin = self.engine_bin.clone();
         let dir = self.data_dir.clone();
-        let n = paths.len();
-        self.busy = true;
-        self.status = format!("Importing {n} document(s)…").into();
-        cx.notify();
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move {
@@ -814,8 +814,10 @@ impl ReaderPanel {
     /// A no-argument engine mutation (combine / split / rotate) reported in
     /// the status line. `verb` is shown while running; `ok_label` on success.
     fn run_op(&mut self, verb: &str, args: Vec<String>, ok_label: &'static str, cx: &mut Context<Self>) {
+        if !self.try_begin(verb, cx) {
+            return;
+        }
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
-        self.begin(verb, cx);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -881,8 +883,10 @@ impl ReaderPanel {
 
     /// Run an engine command that writes a PDF to `out`, then open it (Preview).
     fn run_pdf_tool(&mut self, verb: &str, args: Vec<String>, cx: &mut Context<Self>) {
+        if !self.try_begin(verb, cx) {
+            return;
+        }
         let (bin, dir) = (self.engine_bin.clone(), self.data_dir.clone());
-        self.begin(verb, cx);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -1044,6 +1048,23 @@ impl ReaderPanel {
         self.busy = true;
         self.status = msg.to_string().into();
         cx.notify();
+    }
+
+    /// Like `begin`, but refuses to start while another operation is in
+    /// flight. Every MUTATING operation must go through this: the engine is
+    /// a one-shot subprocess, so this flag is the only mutual exclusion
+    /// between two writers racing on project.sqlite (plus the auto-backup
+    /// each of them runs). Read-only tools may still overlap a mutation —
+    /// WAL readers are safe — but writers must not.
+    fn try_begin(&mut self, msg: &str, cx: &mut Context<Self>) -> bool {
+        if self.busy {
+            self.status = "Busy — wait for the current operation to finish.".into();
+            log_line(&self.data_dir, "mutating op rejected: another operation is in flight");
+            cx.notify();
+            return false;
+        }
+        self.begin(msg, cx);
+        true
     }
 }
 
